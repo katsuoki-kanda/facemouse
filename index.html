@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Face Mouse - Absolute (Coord-Lock & Pause)</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; background: #000; color: #0f0; font-family: sans-serif; text-align: center; overflow: hidden; }
+        canvas { width: 100vw; height: 60vh; object-fit: contain; transform: scaleX(-1); background: #111; border-bottom: 2px solid #333; }
+        .ui { padding: 15px; background: #222; }
+        button { padding: 15px 30px; font-size: 20px; background: #0f0; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
+        #debug { color: #fff; font-family: monospace; font-size: 16px; margin-top: 10px; white-space: pre; }
+    </style>
+</head>
+<body>
+
+    <div class="ui">
+        <button id="connectBtn">1. ESP32に接続</button>
+        <div id="debug">接続後、普通の表情で正面を向いて口を開けてください（両眉上げで一時停止/再開）</div>
+    </div>
+    
+    <video id="input_video" style="display:none"></video>
+    <canvas id="output_canvas"></canvas>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const debugEl = document.getElementById('debug');
+
+let characteristic;
+const SERVICE_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
+const CHAR_UUID    = "19b10001-e8f2-537e-4f6c-d104768a1214";
+
+// 感度設定 (X:1/5, Y:1/4)
+const RANGE_X = 0.15; 
+const RANGE_Y = 0.15; 
+
+let baseFaceX = null, baseFaceY = null;
+let baseLeftDist = null, baseRightDist = null; // 眉の初期距離（正規化済）
+let isPaused = false;                         // 一時停止フラグ
+let lastBrowsRaised = false;                   // 前回の眉上げ状態（チャタリング防止）
+let lastMouthState = false;
+let lockUntil = 0; 
+let currentX = 0.5, currentY = 0.5;
+
+// 通信制御用
+let isSending = false;
+let nextData = null;
+
+document.getElementById('connectBtn').addEventListener('click', async () => {
+    try {
+        const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        characteristic = await service.getCharacteristic(CHAR_UUID);
+        debugEl.innerText = "接続成功！口を開けて開始。";
+    } catch (e) { alert("接続失敗"); }
+});
+
+// 3次元座標の距離を計算するヘルパー関数
+function getDistance(p1, p2) {
+    return Math.sqrt(
+        Math.pow(p1.x - p2.x, 2) +
+        Math.pow(p1.y - p2.y, 2) +
+        Math.pow(p1.z - p2.z, 2)
+    );
+}
+
+// 非ブロッキング送信関数
+function sendData(px, py, click) {
+    nextData = { px, py, click };
+    processQueue();
+}
+
+async function processQueue() {
+    if (isSending || !characteristic || !nextData) return;
+    
+    isSending = true;
+    const { px, py, click } = nextData;
+    nextData = null; 
+
+    const xVal = Math.max(0, Math.min(32767, Math.round(px * 32767)));
+    const yVal = Math.max(0, Math.min(32767, Math.round(py * 32767)));
+    
+    const buffer = new Uint8Array(5);
+    buffer[0] = xVal & 0xFF;
+    buffer[1] = (xVal >> 8) & 0xFF;
+    buffer[2] = yVal & 0xFF;
+    buffer[3] = (yVal >> 8) & 0xFF;
+    buffer[4] = click ? 1 : 0;
+    
+    try {
+        await characteristic.writeValue(buffer);
+    } catch (e) { console.error(e); }
+    
+    isSending = false;
+    if (nextData) processQueue();
+}
+
+function onResults(results) {
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        const landmarks = results.multiFaceLandmarks[0];
+        const nose = landmarks[1];
+        const mouthOpen = (landmarks[14].y - landmarks[13].y) > 0.01;
+        const now = Date.now();
+
+        // 顔のサイズ基準として「両目の内角の距離」を取得（133:左目内角, 362:右目内角）
+        const currentFaceSize = getDistance(landmarks[133], landmarks[362]);
+
+        if (currentFaceSize > 0) {
+            // 現在の眉と目の距離（107:左眉頭, 336:右眉頭）。顔のサイズで割って正規化
+            const currentLeftDist = getDistance(landmarks[107], landmarks[133]) / currentFaceSize;
+            const currentRightDist = getDistance(landmarks[336], landmarks[362]) / currentFaceSize;
+
+            // 口を開けた初期化の瞬間に、眉の初期値も同時に保存
+            if (mouthOpen && baseFaceX === null) {
+                baseFaceX = nose.x;
+                baseFaceY = nose.y;
+                baseLeftDist = currentLeftDist;
+                baseRightDist = currentRightDist;
+            }
+
+            if (baseFaceX !== null && baseLeftDist !== null) {
+                // 初期値から何倍伸びたかで眉上げを判定（1.20 = 初期より20%上の位置で判定）
+                const leftBrowsRaised = (currentLeftDist / baseLeftDist) > 1.20;
+                const rightBrowsRaised = (currentRightDist / baseRightDist) > 1.20;
+                const browsRaised = leftBrowsRaised && rightBrowsRaised;
+
+                // 両眉が上がった「瞬間」だけ一時停止状態を反転（チャタリング防止）
+                if (browsRaised && !lastBrowsRaised) {
+                    isPaused = !isPaused;
+                    
+                    // 【ジャンプ防止機能】一時停止から「再開」した瞬間に、現在の顔の向きを新しい正面（基準）にする
+                    if (!isPaused) {
+                        baseFaceX = nose.x;
+                        baseFaceY = nose.y;
+                    }
+                }
+                lastBrowsRaised = browsRaised;
+
+                // 口を開けた瞬間（クリック開始時）のみ、1秒間の座標ロックタイマーをセット
+                if (mouthOpen && !lastMouthState) {
+                    lockUntil = now + 1000;
+                }
+
+                // タイマーが切れており、かつ一時停止中でないときだけ、座標を更新する
+                if (now > lockUntil && !isPaused) {
+                    let offX = (baseFaceX - nose.x) / (RANGE_X / 2);
+                    let offY = (nose.y - baseFaceY) / (RANGE_Y / 2);
+                    currentX = Math.max(0, Math.min(1, 0.5 + (offX * 0.5)));
+                    currentY = Math.max(0, Math.min(1, 0.5 + (offY * 0.5)));
+                }
+
+                // 【重要】一時停止中でない場合のみESP32へデータを送信（一時停止中は通常マウスをフリーにする）
+                if (!isPaused) {
+                    sendData(currentX, currentY, mouthOpen);
+                }
+
+                lastMouthState = mouthOpen;
+
+                // ステータス表示の切り替え
+                let lockStatus = "FREE";
+                if (isPaused) {
+                    lockStatus = "PAUSED (通常マウス操作可能)";
+                } else if (now < lockUntil) {
+                    lockStatus = "COORD-LOCKED";
+                }
+
+                debugEl.innerText = `X: ${Math.round(currentX * 100)}%, Y: ${Math.round(currentY * 100)}%\n` +
+                                   `Click: ${mouthOpen ? "ON" : "OFF"} | Status: ${lockStatus}\n` +
+                                   `Brows: ${browsRaised ? "RAISED (▲)" : "NORMAL"}`;
+                
+                drawUI(baseFaceX, baseFaceY, nose.x, nose.y, mouthOpen, now < lockUntil, isPaused);
+            }
+        }
+    }
+    canvasCtx.restore();
+}
+
+function drawUI(bx, by, nx, ny, click, isLocked, isPaused) {
+    canvasCtx.strokeStyle = "blue";
+    canvasCtx.strokeRect(bx * canvasElement.width - 20, by * canvasElement.height - 20, 40, 40);
+    
+    // ドットの色変更：クリック=赤, 一時停止=紫, ロック=黄, 通常=緑
+    let dotColor = "lime";
+    if (click) {
+        dotColor = "red";
+    } else if (isPaused) {
+        dotColor = "magenta"; 
+    } else if (isLocked) {
+        dotColor = "yellow";
+    }
+
+    canvasCtx.fillStyle = dotColor;
+    canvasCtx.beginPath();
+    canvasCtx.arc(nx * canvasElement.width, ny * canvasElement.height, (isLocked || isPaused) ? 12 : 8, 0, 2*Math.PI);
+    canvasCtx.fill();
+}
+
+const faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+faceMesh.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => { await faceMesh.send({image: videoElement}); },
+    width: 640, height: 360
+});
+camera.start();
+</script>
+</body>
+</html>
